@@ -103,6 +103,11 @@ _MATCHING_PREFIX_STRIP_PROVIDERS: frozenset[str] = frozenset({
     "ollama-cloud",
     "custom",
     "gemini",
+    # xAI OAuth provider — strips "xai/" prefix so that
+    # delegation.model: xai/grok-4.3 → grok-4.3 (bare name
+    # required by api.x.ai).  Without this, the xAI API
+    # returns 404 "Model not found".
+    "xai-oauth",
     "xai",
 })
 
