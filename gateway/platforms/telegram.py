@@ -16,6 +16,7 @@ import os
 import tempfile
 import html as _html
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -108,57 +109,45 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
 
 MAX_COMMANDS_PER_SCOPE = 30
 
-# ── Local STT transcription (faster-whisper) ──────────────────────────
-# Cached model singleton — loaded once, reused across voice messages.
+# ── Local STT transcription (FunASR SenseVoiceSmall) ──────────────────
+# Global STT model cache
 _LOCAL_STT_MODEL = None
-_LOCAL_STT_MODEL_SIZE = "medium"
-
-
-def _get_stt_config():
-    """Read STT config from config.yaml. Returns (model_size, language)."""
-    import os as _os
-    try:
-        from hermes_constants import get_hermes_home
-        config_path = get_hermes_home() / "config.yaml"
-        if not config_path.exists():
-            return "medium", None
-
-        import yaml as _yaml
-        with open(config_path) as _f:
-            cfg = _yaml.safe_load(_f) or {}
-        stt_cfg = cfg.get("stt", {})
-        local_cfg = stt_cfg.get("local", {})
-        model = str(local_cfg.get("model", "medium") or "medium")
-        lang = local_cfg.get("language") or None  # empty str → None = auto-detect
-        return model, lang
-    except Exception:
-        return "medium", None
+_LOCAL_STT_LOCK = threading.Lock()
 
 
 def _get_local_stt_model():
-    """Lazy-load and cache the faster-whisper model."""
-    global _LOCAL_STT_MODEL, _LOCAL_STT_MODEL_SIZE
-    if _LOCAL_STT_MODEL is None:
-        model_size, _ = _get_stt_config()
-        _LOCAL_STT_MODEL_SIZE = model_size
-        from faster_whisper import WhisperModel
-        _LOCAL_STT_MODEL = WhisperModel(
-            _LOCAL_STT_MODEL_SIZE, device="cpu", compute_type="int8"
-        )
-    return _LOCAL_STT_MODEL
+    """Lazy-load and cache the FunASR SenseVoiceSmall model."""
+    global _LOCAL_STT_MODEL
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    if _LOCAL_STT_MODEL is not None:
+        _log.info("[FunASR] Model cache HIT (id=%s)", id(_LOCAL_STT_MODEL))
+        return _LOCAL_STT_MODEL
+    _log.info("[FunASR] Model cache MISS — loading...")
+    with _LOCAL_STT_LOCK:
+        if _LOCAL_STT_MODEL is None:
+            from funasr import AutoModel
+            _LOCAL_STT_MODEL = AutoModel(
+                model='FunAudioLLM/SenseVoiceSmall',
+                device='cpu',
+                hub='hf',
+                disable_update=True,
+            )
+            _log.info("[FunASR] Model loaded (id=%s)", id(_LOCAL_STT_MODEL))
+        return _LOCAL_STT_MODEL
 
 
 async def _transcribe_voice_local(audio_path: str) -> str:
-    """Transcribe .ogg/.mp3/.wav with local faster-whisper. Returns text or empty string."""
+    """Transcribe .ogg/.mp3/.wav with local FunASR SenseVoiceSmall. Returns text or empty string."""
     import asyncio as _asyncio
-    import subprocess as _subprocess
     import os as _os
     import tempfile as _tempfile
 
     # Convert to 16kHz mono wav if not already
     wav_path = audio_path
     if not audio_path.endswith('.wav'):
-        wav_path = _tempfile.mktemp(suffix='.wav')
+        with _tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as _tf:
+            wav_path = _tf.name
         proc = await _asyncio.create_subprocess_exec(
             'ffmpeg', '-y', '-i', audio_path,
             '-ar', '16000', '-ac', '1', wav_path,
@@ -166,14 +155,22 @@ async def _transcribe_voice_local(audio_path: str) -> str:
             stderr=_asyncio.subprocess.PIPE,
         )
         await proc.wait()
+        if proc.returncode != 0:
+            if wav_path != audio_path: os.unlink(wav_path)
+            return ""
 
     loop = _asyncio.get_running_loop()
 
     def _run():
         model = _get_local_stt_model()
-        _, lang = _get_stt_config()  # None = auto-detect language
-        segments, _ = model.transcribe(wav_path, language=lang)
-        return ''.join(seg.text.strip() for seg in segments)
+        with _LOCAL_STT_LOCK:
+            result = model.generate(input=wav_path, language="auto", use_itn=True)
+        if isinstance(result, list) and result:
+            raw = (result[0] or {}).get("text", "") if isinstance(result[0], dict) else ""
+            # Strip SenseVoiceSmall tags: <|zh|>, <|EMO_*|>, <|Speech|>, <|withitn|>, etc.
+            text = re.sub(r'<\|[^|]*\|>', '', raw).strip()
+            return text
+        return ''
 
     try:
         text = await loop.run_in_executor(None, _run)
@@ -6265,57 +6262,50 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache photo: %s", e, exc_info=True)
 
-        # Download voice/audio messages to cache for STT transcription
-        if msg.voice:
+        # Download voice/audio and transcribe with local FunASR
+        if msg.voice or msg.audio:
+            audio_msg = msg.voice or msg.audio
+            audio_type = "voice message" if msg.voice else "audio file"
+            ext = ".ogg" if msg.voice else ".mp3"
             try:
-                allowed, note = self._telegram_media_size_allowed(msg.voice, "voice message")
+                allowed, note = self._telegram_media_size_allowed(audio_msg, audio_type)
                 if not allowed:
                     event.text = self._append_observed_note(event.text, note or "")
-                    logger.info("[Telegram] Skipped oversized user voice (size=%s)", getattr(msg.voice, "file_size", None))
+                    logger.info("[Telegram] Skipped oversized user %s (size=%s)", audio_type, getattr(audio_msg, "file_size", None))
                     await self.handle_message(event)
                     return
-                file_obj = await msg.voice.get_file()
+                file_obj = await audio_msg.get_file()
                 audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
+                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=ext)
                 event.media_urls = [cached_path]
-                event.media_types = ["audio/ogg"]
-                logger.info("[Telegram] Cached user voice at %s", cached_path)
-                # Override Telegram's transcription with local STT for better accuracy.
-                # Only override when there's no caption (caption is user's explicit text).
-                if not msg.caption:
-                    try:
-                        local_text = await _transcribe_voice_local(cached_path)
-                        if local_text:
-                            event.text = local_text
-                            logger.info(
-                                "[Telegram] Local STT override (len=%d): %s",
-                                len(local_text), local_text[:120]
-                            )
-                    except Exception as _stt_err:
-                        logger.warning(
-                            "[Telegram] Local STT failed, falling back to Telegram: %s",
-                            _stt_err
-                        )
-            except Exception as e:
-                logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
-        elif msg.audio:
-            try:
-                allowed, note = self._telegram_media_size_allowed(msg.audio, "audio file")
-                if not allowed:
-                    event.text = self._append_observed_note(event.text, note or "")
-                    logger.info("[Telegram] Skipped oversized user audio (size=%s)", getattr(msg.audio, "file_size", None))
-                    await self.handle_message(event)
-                    return
-                file_obj = await msg.audio.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
-                event.media_urls = [cached_path]
-                event.media_types = ["audio/mp3"]
-                logger.info("[Telegram] Cached user audio at %s", cached_path)
-            except Exception as e:
-                logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
+                event.media_types = [f"audio/{ext.lstrip('.')}"]
+                logger.info("[Telegram] Cached user %s at %s", audio_type, cached_path)
 
-        elif msg.video:
+                # Always attempt FunASR transcription (regardless of caption)
+                try:
+                    local_text = await _transcribe_voice_local(cached_path)
+                    if local_text:
+                        if event.text:
+                            # Has caption: prepend FunASR text
+                            event.text = f"{local_text}\n\n{event.text}"
+                        else:
+                            event.text = local_text
+                        logger.info(
+                            "[Telegram] FunASR STT (len=%d): %s",
+                            len(local_text), local_text[:120]
+                        )
+                except Exception as _stt_err:
+                    logger.warning(
+                        "[Telegram] FunASR STT failed: %s",
+                        _stt_err
+                    )
+                finally:
+                    event.media_urls = []  # Always clear — prevent standard STT path
+
+            except Exception as e:
+                logger.warning("[Telegram] Failed to cache %s: %s", audio_type, e, exc_info=True)
+
+        if msg.video:
             try:
                 file_obj = await msg.video.get_file()
                 video_bytes = await file_obj.download_as_bytearray()
@@ -6333,7 +6323,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[Telegram] Failed to cache video: %s", e, exc_info=True)
 
         # Download document files to cache for agent processing
-        elif msg.document:
+        if msg.document:
             doc = msg.document
             try:
                 # Determine file extension
