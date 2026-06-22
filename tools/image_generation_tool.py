@@ -1002,11 +1002,16 @@ from tools.registry import registry, tool_error
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts. The underlying "
-        "backend (FAL, OpenAI, etc.) and model are user-configured and not "
-        "selectable by the agent. Returns either a URL or an absolute file "
-        "path in the `image` field; display it with markdown "
-        "![description](url-or-path) and the gateway will deliver it. When "
+        "Generate high-quality images from text prompts (text-to-image), or "
+        "edit / transform an existing image (image-to-image) when the active "
+        "model supports it. Pass `image_url` to edit that image; add "
+        "`reference_image_urls` for style/composition references; omit both "
+        "for text-to-image. The underlying backend (FAL, OpenAI, xAI, etc.) "
+        "and model are user-configured and not selectable by the agent. "
+        "Returns the result in the `image` field — either a URL or an absolute "
+        "file path. To show it to the user, reference that path/URL in your "
+        "response using the file-delivery convention for the current platform "
+        "(your platform guidance describes how files are delivered here). When "
         "the active terminal backend has a different filesystem, successful "
         "local-file results may also include `agent_visible_image` for "
         "follow-up terminal/file operations."
