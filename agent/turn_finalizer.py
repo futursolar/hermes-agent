@@ -122,10 +122,14 @@ def finalize_turn(
                 )
 
     # Determine if conversation completed successfully
+    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
         final_response is not None
-        and api_call_count < agent.max_iterations
         and not failed
+        and (
+            api_call_count < agent.max_iterations
+            or normal_text_response
+        )
     )
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
